@@ -1,6 +1,8 @@
+import argparse
 import torch
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "0,1"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# os.environ['CUDA_VISIBLE_DEVICES'] = "0,1" # 将通过命令行参数设置
 import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import re
@@ -447,10 +449,32 @@ def qwen_test():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Model Testing Script for HomeBench.")
+    parser.add_argument("--model_name", type=str, default="mistral", 
+                        choices=["llama", "qwen", "mistral", "gemma"], 
+                        help="Name of the model to test.")
+    parser.add_argument("--use_rag", action="store_true", 
+                        help="Whether to use Retrieval-Augmented Generation (RAG).")
+    parser.add_argument("--use_few_shot", action="store_true", 
+                        help="Whether to use Few-Shot Learning.")
+    parser.add_argument("--test_type", type=str, default="error_input", 
+                        help="Type of test to run (e.g., \"error_input\").")
+    parser.add_argument("--cuda_devices", type=str, default="0,1", 
+                        help="Comma-separated list of CUDA device IDs to use. E.g., \"0,1\" or \"0\".")
+
+    args = parser.parse_args()
+    
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_devices
+    print(f"Using CUDA devices: {os.environ['CUDA_VISIBLE_DEVICES']}")
+
+    model_test(args.model_name, use_rag=args.use_rag, use_few_shot=args.use_few_shot, test_type=args.test_type)
+    # 以下为示例，如果您需要运行，请取消注释并根据需要调整。
+    # rag_dataset("path/to/your/models/Qwen2.5-7B-Instruct") # 注意这里的路径，我已经修改为相对路径，请根据您的实际情况调整。
     # llama_test()
-    model_test("mistral",use_rag=False,use_few_shot=True,test_type="error_input")
-    # rag_dataset('/home/slli/home_assistant/model/Qwen2.5-7B-Instruct')
-    # f = open("/home/slli/home_assistant/our_dataset/raw_data/llama_test_result.json", "r")
+    # qwen_test()
+
+    # 示例评估代码，现在可以通过 eval.py 脚本运行
+    # f = open("../output/llama_test_result.json", "r")
     # res = json.loads(f.read())
     # f.close()
     # generated_texts = []

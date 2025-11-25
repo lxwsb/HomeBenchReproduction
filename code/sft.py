@@ -1,6 +1,8 @@
+import argparse
 import torch
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# os.environ['CUDA_VISIBLE_DEVICES'] = "1" # 将通过命令行参数设置
 import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import re
@@ -211,5 +213,16 @@ def sft_model(model_name):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Supervised Fine-Tuning Script for HomeBench.")
+    parser.add_argument("--model_name", type=str, default="qwen", 
+                        choices=["llama", "qwen", "mistral", "gemma"], 
+                        help="Name of the model to fine-tune.")
+    parser.add_argument("--cuda_devices", type=str, default="1", 
+                        help="Comma-separated list of CUDA device IDs to use. E.g., \"0,1\" or \"0\".")
+    
+    args = parser.parse_args()
+    
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_devices
+    print(f"Using CUDA devices: {os.environ['CUDA_VISIBLE_DEVICES']}")
 
-    sft_model("qwen")
+    sft_model(args.model_name)

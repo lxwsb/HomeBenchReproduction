@@ -1,6 +1,9 @@
+import argparse
 import json
 import re
 from collections import Counter
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 def compute_accuracy(generated_texts, expected_texts):
     print("nums"   , len(generated_texts))
@@ -156,20 +159,24 @@ def dif_type(test_data):
 
 
 
-f = open("../output/deepseek_r1_no_fewshot2.json", "r")
-data = f.readlines()
-# data = json.load(f)
-test_data = []
-generated_output = []
-excepted_output = []
-for item in data:
-    item = json.loads(item)
-    generated_output.append(item["generated"])
-    excepted_output.append(item["expected"])
-    test_data.append({"generated_output": item["generated"], "gold_output": item["expected"]})
-    # generated_output.append(item["gpt_output"])
-    # excepted_output.append(item["golden_output"])
-    # test_data.append({"generated_output": item["gpt_output"], "gold_output": item["golden_output"]})
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Model Evaluation Script for HomeBench.")
+    parser.add_argument("--result_file", type=str, 
+                        default="../output/deepseek_r1_no_fewshot2.json",
+                        help="Path to the model test result JSON file to evaluate.")
+    
+    args = parser.parse_args()
 
-
-dif_type(test_data)
+    f = open(args.result_file, "r")
+    data = f.readlines()
+    f.close()
+    test_data = []
+    generated_output = []
+    excepted_output = []
+    for item in data:
+        item = json.loads(item)
+        generated_output.append(item["generated"])
+        excepted_output.append(item["expected"])
+        test_data.append({"generated_output": item["generated"], "gold_output": item["expected"]})
+    
+    dif_type(test_data)
