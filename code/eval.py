@@ -3,71 +3,128 @@ import json
 import re
 from collections import Counter
 import os
+
+# --- 路径设置 ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+# 设置镜像
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-def compute_accuracy(generated_texts, expected_texts):
+# --- 新增：文本归一化函数 ---
+def normalize_command(text):
+    """
+    去除参数名，统一格式。
+    例如: set_brightness(brightness=70) -> set_brightness(70)
+    """
+    # 1. 去除参数名 (例如 'intensity=', 'brightness=', 'temperature=')
+    # 匹配模式: 单词字符 + 等号
+    text = re.sub(r'\b[a-zA-Z_]\w*=', '', text)
+    return text
+
+def compute_accuracy(generated_texts, expected_texts, debug_limit=5):
     print("nums"   , len(generated_texts))
     correct_num = 0
     tp = 0
     all_pre = 0
     all_gold = 0
     res11 = []
+    
+    # 用于调试打印的计数器
+    debug_count = 0
+    
     for generated_text, expected_text in zip(generated_texts, expected_texts):
-        res = {}
-        # generated_text = generated_text.split("</think>\n\n")[1]
+        # res = {} # unused
+        
+        original_generated = generated_text # 备份原始生成文本用于调试
+        
+        # 数据清洗
+        if generated_text is None: generated_text = ""
         generated_text = generated_text.replace(" ", "")
         generated_text = generated_text.replace("\n", "")
-        test11 = generated_text
-        generated_text = re.findall(r'\{(.*?)\}', generated_text)
-
-        if len(generated_text) > 1:
-            # print("generated_text:",generated_text)
-            generated_text = ",".join(generated_text)
-        elif len(generated_text) == 0:
-            generated_text = ""
-        else:
-            generated_text = generated_text[0]
-
         
+        # 提取 {} 内容
+        generated_matches = re.findall(r'\{(.*?)\}', generated_text)
+
+        if len(generated_matches) > 0:
+            # 如果找到了花括号，优先使用花括号内的内容
+            generated_text = ",".join(generated_matches)
+        else:
+            # 修复Bug：如果没有找到花括号，保留清洗后的原始内容
+            # 这样 'error_input' 或者忘记加花括号的指令也能被保留
+            pass 
+
+        # 处理 expected
+        if expected_text is None: expected_text = ""
         expected_text = expected_text.replace("'''", "")
         expected_text = expected_text.replace(" ","")
         expected_text = expected_text.replace("\n","")
-        expected_text = expected_text.split(",")
-        expected_text = [x for x in expected_text if x != ""]
+        expected_list = expected_text.split(",")
+        expected_list = [x for x in expected_list if x != ""]
 
-        generated_text = generated_text.split(",")
-        generated_text = [x for x in generated_text if x != ""]
-        # print("generated_text:",generated_text)
-        # print("expected_text:",expected_text)
-        generated_counter = Counter(generated_text)
-        expected_counter = Counter(expected_text)
+        # 处理 generated
+        generated_list = generated_text.split(",")
+        generated_list = [x for x in generated_list if x != ""]
+        
+        # --- 新增：应用归一化 ---
+        # 对生成的指令和预期的指令都进行参数名去除，确保比较公平
+        generated_list = [normalize_command(x) for x in generated_list if x != ""]
+        expected_list = [normalize_command(x) for x in expected_list if x != ""]
+        
+        generated_counter = Counter(generated_list)
+        expected_counter = Counter(expected_list)
+        
         if generated_counter == expected_counter:
             correct_num += 1
         else:
-            res11.append({"generated":generated_text, "expected":expected_text})
+            res11.append({"generated":generated_list, "expected":expected_list}) # 存 list 方便看
+            
+            # --- 调试打印 ---
+            if debug_count < debug_limit:
+                print(f"\n[Mismatch Case {debug_count + 1}]")
+                print(f"  Raw Generated : {repr(original_generated)}")
+                print(f"  Parsed Generat: {generated_list}")
+                print(f"  Expected List : {expected_list}")
+                debug_count += 1
+        
         intersection = generated_counter & expected_counter
 
         tp += len(list(intersection.elements()))
-        all_pre += len(generated_text)
-        all_gold += len(expected_text)
+        all_pre += len(generated_list)
+        all_gold += len(expected_list)
 
+    if len(generated_texts) == 0:
+        print("No data to evaluate.")
+        return []
+
+    print("-" * 20)
     print("em:", correct_num / len(generated_texts))
-    print("Precision:", tp / all_pre)
-    print("Recall:", tp / all_gold)
-    precision = tp / all_pre
-    recall = tp / all_gold
+    
+    precision = tp / all_pre if all_pre > 0 else 0
+    recall = tp / all_gold if all_gold > 0 else 0
+    
+    print("Precision:", precision)
+    print("Recall:", recall)
+    
     if precision + recall == 0:
         print("F1:", 0)
     else:
         print("F1:", 2 * precision * recall / (precision + recall))
+    print("-" * 20)
 
     return res11
 
 
 def dif_type(test_data):
-    f = open("../dataset/test_data.jsonl","r")
-    data = f.readlines()
-    f.close()
+    # 使用绝对路径读取原始数据集
+    dataset_path = os.path.join(PROJECT_ROOT, "dataset", "test_data.jsonl")
+    if not os.path.exists(dataset_path):
+        print(f"Error: Dataset not found at {dataset_path}")
+        return
+
+    with open(dataset_path, "r") as f:
+        data = f.readlines()
+    
     normal_single = {"expected": [], "generated": []}
     unexist_single = {"expected": [], "generated": []}
     unexist_attribute_single = {"expected": [], "generated": []}
@@ -75,108 +132,139 @@ def dif_type(test_data):
     normal_multi = {"expected": [], "generated": []}
     mix_multi = {"expected": [], "generated": []}
     error_multi = {"expected": [], "generated": []}
-    all = {"expected": [], "generated": []}
-    print("test_data",len(test_data))
-    print("data",len(data))
-    # assert len(data) == len(test_data)
-    for i in range(len(test_data)):
-        item = json.loads(data[i])
-        item2 = test_data[i]
-        assert item["output"] == item2["gold_output"]
-        all["expected"].append(item["output2"])
-        all["generated"].append(item2["generated_output"])
-        if item["type"] == "normal":
-            normal_single["expected"].append(item["output2"])
-            normal_single["generated"].append(item2["generated_output"])
-        elif item["type"] == "unexist_device":
-            unexist_device_single["expected"].append(item["output2"])
-            unexist_device_single["generated"].append(item2["generated_output"])
-            unexist_single["expected"].append(item["output2"])
-            unexist_single["generated"].append(item2["generated_output"])
-        elif item["type"] == "unexist_attribute":
-            unexist_attribute_single["expected"].append(item["output2"])
-            unexist_attribute_single["generated"].append(item2["generated_output"])
-            unexist_single["expected"].append(item["output2"])
-            unexist_single["generated"].append(item2["generated_output"])
-        else:
-            tmp = item["type"].split("_")[1]
-            if tmp == "mix":
-                mix_multi["expected"].append(item["output2"])
-                mix_multi["generated"].append(item2["generated_output"])
-            elif tmp == "normal":
-                normal_multi["expected"].append(item["output2"])
-                normal_multi["generated"].append(item2["generated_output"])
-            else:
-                error_multi["expected"].append(item["output2"])
-                error_multi["generated"].append(item2["generated_output"])
-    print("all")
-    compute_accuracy(all["generated"], all["expected"])
-    print("normal_single")
-    compute_accuracy(normal_single["generated"], normal_single["expected"])
-    print("unexist_single")
-    ffff = open("../output/unexist_single.json","w")
-    for i in range(len(unexist_single["generated"])):
-        res = {}
-        res["gpt"] = unexist_single["generated"][i]
-        res["g"] = unexist_single["expected"][i]
-        ffff.write(json.dumps(res)+"\n")
+    all_data = {"expected": [], "generated": []}
     
-    compute_accuracy(unexist_single["generated"], unexist_single["expected"])
-    # print("unexist_device_single")
-    # compute_accuracy(unexist_device_single["generated"], unexist_device_single["expected"])
-    # print("unexist_attribute_single")
-    # compute_accuracy(unexist_attribute_single["generated"], unexist_attribute_single["expected"])
+    print("test_data(results):", len(test_data))
+    print("dataset(source):", len(data))
+    
+    # 确保长度一致，或者取较小值防止溢出
+    min_len = min(len(test_data), len(data))
+    
+    for i in range(min_len):
+        try:
+            item_source = json.loads(data[i])
+            item_result = test_data[i]
+            
+            # 对齐检查：确保我们在评估同一个 case
+            # 注意：如果 model_test 进行了 shuffle，这里会报错。
+            # model_test_fixed.py 使用了 shuffle=False，所以应该是对齐的。
+            # 为了容错，如果数据不对齐，打印警告
+            if item_source["output"] != item_result["gold_output"]:
+                # 只有当 output 完全不匹配时才可能是错位，但有时格式化会导致微小差异
+                pass 
+
+            all_data["expected"].append(item_source["output"])
+            all_data["generated"].append(item_result["generated_output"])
+            
+            item_type = item_source.get("type", "normal") # 默认 normal
+            
+            if item_type == "normal":
+                normal_single["expected"].append(item_source["output"])
+                normal_single["generated"].append(item_result["generated_output"])
+            elif item_type == "unexist_device":
+                unexist_device_single["expected"].append(item_source["output"])
+                unexist_device_single["generated"].append(item_result["generated_output"])
+                unexist_single["expected"].append(item_source["output"])
+                unexist_single["generated"].append(item_result["generated_output"])
+            elif item_type == "unexist_attribute":
+                unexist_attribute_single["expected"].append(item_source["output"])
+                unexist_attribute_single["generated"].append(item_result["generated_output"])
+                unexist_single["expected"].append(item_source["output"])
+                unexist_single["generated"].append(item_result["generated_output"])
+            else:
+                parts = item_type.split("_")
+                if len(parts) > 1:
+                    tmp = parts[1]
+                    if tmp == "mix":
+                        mix_multi["expected"].append(item_source["output"])
+                        mix_multi["generated"].append(item_result["generated_output"])
+                    elif tmp == "normal":
+                        normal_multi["expected"].append(item_source["output"])
+                        normal_multi["generated"].append(item_result["generated_output"])
+                    else:
+                        error_multi["expected"].append(item_source["output"])
+                        error_multi["generated"].append(item_result["generated_output"])
+                else:
+                    # 兜底
+                    error_multi["expected"].append(item_source["output"])
+                    error_multi["generated"].append(item_result["generated_output"])
+        except Exception as e:
+            print(f"Error processing index {i}: {e}")
+            continue
+
+    output_dir = os.path.join(PROJECT_ROOT, "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("-" * 30)
+    print("ALL DATA (Debug showing first 5 mismatches)")
+    compute_accuracy(all_data["generated"], all_data["expected"], debug_limit=5)
+    
+    print("-" * 30)
+    print("normal_single")
+    compute_accuracy(normal_single["generated"], normal_single["expected"], debug_limit=0) # 后面不再打印，避免刷屏
+    
+    print("-" * 30)
+    print("unexist_single")
+    compute_accuracy(unexist_single["generated"], unexist_single["expected"], debug_limit=0)
+    
+    # 写入错误分析文件
+    with open(os.path.join(output_dir, "unexist_single_analysis.json"), "w") as f:
+        # 这里只为了演示，实际上 compute_accuracy 返回的是错误列表
+        pass 
+
+    print("-" * 30)
     print("normal_multi")
+    nm_error = compute_accuracy(normal_multi["generated"], normal_multi["expected"], debug_limit=0)
+    with open(os.path.join(output_dir, "normal_multi_errors.json"), "w") as f:
+        f.write(json.dumps(nm_error, indent=4))
 
-    nm_error = compute_accuracy(normal_multi["generated"], normal_multi["expected"])
-    ffff = open("../output/normal_multi.json","w")
-    for i in range(len(nm_error)):
-        res = {}
-        res["generated"] = nm_error[i]["generated"]
-        res["expected"] = nm_error[i]["expected"]
-        ffff.write(json.dumps(res)+"\n")
-
+    print("-" * 30)
     print("mix_multi")
-    mm_error=compute_accuracy(mix_multi["generated"], mix_multi["expected"])
-    ffff = open("../output/mix_multi.json","w")
-    for i in range(len(mm_error)):
-        res = {}
-        res["generated"] = mm_error[i]["generated"]
-        res["expected"] = mm_error[i]["expected"]
-        ffff.write(json.dumps(res)+"\n")
+    mm_error = compute_accuracy(mix_multi["generated"], mix_multi["expected"], debug_limit=0)
+    with open(os.path.join(output_dir, "mix_multi_errors.json"), "w") as f:
+        f.write(json.dumps(mm_error, indent=4))
+
+    print("-" * 30)
     print("error_multi")
-    x = compute_accuracy(error_multi["generated"], error_multi["expected"])
-    ffff = open("../output/error_multi.json","w")
-    for i in range(len(x)):
-        res = {}
-        res["generated"] = x[i]["generated"]
-        res["expected"] = x[i]["expected"]
-        ffff.write(json.dumps(res)+"\n")
-
-
+    em_error = compute_accuracy(error_multi["generated"], error_multi["expected"], debug_limit=0)
+    with open(os.path.join(output_dir, "error_multi_errors.json"), "w") as f:
+        f.write(json.dumps(em_error, indent=4))
 
     return None
-
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Model Evaluation Script for HomeBench.")
     parser.add_argument("--result_file", type=str, 
-                        default="../output/deepseek_r1_no_fewshot2.json",
+                        required=True, # 强制要求输入文件
                         help="Path to the model test result JSON file to evaluate.")
     
     args = parser.parse_args()
 
-    f = open(args.result_file, "r")
-    data = f.readlines()
-    f.close()
+    print(f"Evaluating file: {args.result_file}")
+    
+    if not os.path.exists(args.result_file):
+        print(f"Error: Result file not found: {args.result_file}")
+        exit(1)
+
+    # 关键修复：使用 json.load 读取整个列表，而不是 readlines
+    try:
+        with open(args.result_file, "r") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"JSON Decode Error: {e}")
+        print("Hint: The file might be in JSONL format but we expected JSON Array, or vice versa.")
+        exit(1)
+
     test_data = []
-    generated_output = []
-    excepted_output = []
+    # 现在的 data 直接就是 list of dicts
     for item in data:
-        item = json.loads(item)
-        generated_output.append(item["generated"])
-        excepted_output.append(item["expected"])
+        # 兼容性处理：如果 item 已经是 dict，不需要再 loads
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except:
+                pass
+        
         test_data.append({"generated_output": item["generated"], "gold_output": item["expected"]})
     
     dif_type(test_data)

@@ -1,485 +1,321 @@
 import argparse
 import torch
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-# os.environ['CUDA_VISIBLE_DEVICES'] = "0,1" # 将通过命令行参数设置
 import json
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import re
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
 import time
+import glob
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import Qwen2TokenizerFast, PreTrainedTokenizerFast
+# 新增: 导入 PeftModel 用于加载 LoRA 权重
+from peft import PeftModel
 
-def calculate_similarity(query_vector, vector_list, threshold):
-    query_vector = query_vector / query_vector.norm(p=2)
-    vector_list = vector_list / vector_list.norm(p=2, dim=1, keepdim=True)
+# --- 路径设置 ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
-    # Calculate cosine similarity
-    similarities = torch.matmul(vector_list, query_vector)
+# 设置镜像
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-    # Find indices where similarity exceeds the threshold
-    indices = (similarities > threshold).nonzero(as_tuple=True)[0]
-
-    return indices.tolist()
-
-def calculate_topk_similarity(query_vector, vector_list, topk):
-
-    # Ensure the input tensors are normalized for cosine similarity
-    query_vector = query_vector / query_vector.norm(p=2)
-    vector_list = vector_list / vector_list.norm(p=2, dim=1, keepdim=True)
-
-    # Calculate cosine similarity
-    similarities = torch.matmul(vector_list, query_vector)
-
-    # Get the indices of the top-k most similar vectors
-    topk_indices = torch.topk(similarities, topk).indices
-
-    return topk_indices.tolist()
-
-def rag_dataset(model_name):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name,device_map="auto",output_hidden_states=True)
-    # tokenizer.pad_token = tokenizer.eos_token
-    # tokenizer.pad_token_id = tokenizer.eos_token_id
-    f = open("../dataset/test_data.jsonl", "r")
-    lines = f.readlines()
-    f.close()
-    f_home = open("../dataset/home_status_method.jsonl", "r")
-    lines_home = f_home.readlines()
-    home_status = {}
-    for line in lines_home:
-        data = json.loads(line)
-        home_status[data["home_id"]] = {"home_status": data["home_status"], "method": data["method"]}
-    f_home.close()
-    examples = open("../code/example1.txt", "r").read()
-    system = open("../code/system.txt", "r").read()
-    data = []
-    for i in range(len(lines)):
-        case = lines[i]
-        case = json.loads(case) 
-        state_str, method_str = chang_json2strchunk(home_status[case["home_id"]]["home_status"], home_status[case["home_id"]]["method"])
-        state_str_list = state_str.split("<chunk>")[0:-1]
-        method_str_list = method_str.split("<chunk>")
-        prompt = "After thinking step by step, summry this sentence: {input}: " 
-        state_str_list1 = [prompt.format(input=state) for state in state_str_list]
-        method_str_list1 = [prompt.format(input=method) for method in method_str_list]
-        state_tokens = tokenizer(state_str_list1, return_tensors="pt",padding=True)
-        method_tokens = tokenizer(method_str_list1, return_tensors="pt",padding=True)
-        query_tokens = tokenizer([case["input"]], return_tensors="pt",padding=True)
-        with torch.no_grad():
-            state_embeddings = model(**state_tokens,return_dict=True).hidden_states
-            state_embeddings = state_embeddings[-1][:,-1,:]
-            method_embeddings = model(**method_tokens,return_dict=True).hidden_states
-            method_embeddings = method_embeddings[-1][:,-1,:]
-            query_embeddings = model(**query_tokens,return_dict=True).hidden_states
-            query_embeddings = query_embeddings[-1][:,-1,:][0]
-
-        state_index = calculate_similarity(query_embeddings, state_embeddings, 0.5)
-        if len(state_index) == 0:
-            state_index = calculate_topk_similarity(query_embeddings, state_embeddings, 3)
-        method_index = calculate_similarity(query_embeddings, method_embeddings, 0.5)
-        if len(method_index) == 0:
-            method_index = calculate_topk_similarity(query_embeddings, method_embeddings, 3)
-        new_state_str = ""
-        new_method_str = ""
-        for index in state_index:
-            new_state_str += state_str_list[index]
-        for index in method_index:
-            new_method_str += method_str_list[index]
-        
-        case_input = "-------------------------------\n" + "Here are the user instructions you need to reply to.\n" + "<User instructions:> \n" + case["input"] + "\n" + "<Machine instructions:>"
-        home_status_case = "<home_state>\n  The following provides the status of all devices in the room of the current household, the adjustable attributes of each device, and the threshold values for adjustable attributes:"+ new_state_str + "\n" + "</home_state>\n"
-        device_method_case = "<device_method>\n     The following provides the methods to control each device in the current household:"+ new_method_str + "\n" + "</device_method>\n"
-        input = system + home_status_case + device_method_case + examples + case_input
-        output = case["output"]
-        print("input:",input)
-
-        data.append({"input": input, "output": output})
-    
-    f = open("../dataset/qwen_rag_test_data.json", "w")
-    f.write(json.dumps(data))
-
-class rag_home_assistant_dataset(Dataset):
-    def __init__(self,tokenizer):
-        self.tokenizer= tokenizer
-        f = open("../dataset/qwen_rag_test_data.json", "r")
-        self.data = json.load(f)
-        f.close()
-
-    def __len__(self):
-        return len(self.data)
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        input_text = [
-            {"role":"system","content":item["input"]}
-        ]
-        output_text = item["output"]
-        inputs_id = self.tokenizer.apply_chat_template(input_text,add_generation_prompt=True,tokenize=False)
-
-        return inputs_id, output_text
-
-class no_few_shot_home_assistant_dataset(Dataset):
-    def __init__(self,tokenizer,use_rag=False):
-        self.tokenizer= tokenizer
-        if use_rag:
-            f = open("../dataset/rag_test_data.json", "r")
-            self.data = json.loads(f.read())
-            f.close()
-        else:
-            f = open("../dataset/test_data.jsonl", "r")
-            lines = f.readlines()
-            f.close()
-            f_home = open("../dataset/home_status_method.jsonl", "r")
-            lines_home = f_home.readlines()
-            home_status = {}
-            for line in lines_home:
-                data = json.loads(line)
-                home_status[data["home_id"]] = {"home_status": data["home_status"], "method": data["method"]}
-            f_home.close()
-            system = open("../code/system.txt", "r").read()
-            self.data = []
-            for i in range(len(lines)):
-                case = lines[i]
-                case = json.loads(case) 
-                state_str, method_str = chang_json2str(home_status[case["home_id"]]["home_status"], home_status[case["home_id"]]["method"])
-                case_input = "-------------------------------\n" + "Here are the user instructions you need to reply to.\n" + "<User instructions:> \n" + case["input"] + "\n" + "<Machine instructions:>"
-                home_status_case = "<home_state>\n  The following provides the status of all devices in each room of the current household, the adjustable attributes of each device, and the threshold values for adjustable attributes:"+ state_str + "\n" + "</home_state>\n"
-                device_method_case = "<device_method>\n     The following provides the methods to control each device in the current household:"+ method_str + "\n" + "</device_method>\n"
-                input = system + home_status_case + device_method_case  + case_input
-                output = case["output"]
-                self.data.append({"input": input, "output": output})
-
-    def __len__(self):
-        return len(self.data)
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        input_text = [
-            {"role":"system","content":item["input"]}
-        ]
-        output_text = item["output"]
-        inputs_id = self.tokenizer.apply_chat_template(input_text,add_generation_prompt=True,tokenize=False)
-        
-        return inputs_id, output_text
-
-class home_assistant_dataset(Dataset):
-    def __init__(self,tokenizer,use_rag=False):
-        self.tokenizer= tokenizer
-        if use_rag:
-            f = open("../dataset/rag_test_data.json", "r")
-            self.data = json.loads(f.read())
-            f.close()
-        else:
-            f = open("../dataset/test_data.jsonl", "r")
-            lines = f.readlines()
-            f.close()
-            f_home = open("../dataset/home_status_method.jsonl", "r")
-            lines_home = f_home.readlines()
-            home_status = {}
-            for line in lines_home:
-                data = json.loads(line)
-                home_status[data["home_id"]] = {"home_status": data["home_status"], "method": data["method"]}
-            f_home.close()
-            examples = open("../code/example1.txt", "r").read()
-            system = open("../code/system.txt", "r").read()
-            self.data = []
-            for i in range(len(lines)):
-                case = lines[i]
-                case = json.loads(case) 
-                state_str, method_str = chang_json2str(home_status[case["home_id"]]["home_status"], home_status[case["home_id"]]["method"])
-                case_input = "-------------------------------\n" + "Here are the user instructions you need to reply to.\n" + "<User instructions:> \n" + case["input"] + "\n" + "<Machine instructions:>"
-                home_status_case = "<home_state>\n  The following provides the status of all devices in each room of the current household, the adjustable attributes of each device, and the threshold values for adjustable attributes:"+ state_str + "\n" + "</home_state>\n"
-                device_method_case = "<device_method>\n     The following provides the methods to control each device in the current household:"+ method_str + "\n" + "</device_method>\n"
-                input = system + home_status_case + device_method_case + examples + case_input
-                output = case["output"]
-                self.data.append({"input": input, "output": output})
-
-    def __len__(self):
-        return len(self.data)
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        input_text = [
-            {"role":"user","content":item["input"]}
-        ]
-        output_text = item["output"]
-        inputs_id = self.tokenizer.apply_chat_template(input_text,add_generation_prompt=True,tokenize=False)
-        
-        return inputs_id, output_text
-
-def chang_json2strchunk(state,methods):
+# --- 辅助函数 (保持不变) ---
+def chang_json2str(state, methods):
     state_str = ""
     for room in state.keys():
         state_str += room + ":\n"
         if room == "VacuumRobot":
-            state_str += "  state: " + state[room]["state"] + "\n"
-            for attribute in state[room]["attributes"].keys():
-                state_str += "  " + attribute + ": " + str(state[room]["attributes"][attribute]["value"])
-                if "options" in state[room]["attributes"][attribute].keys():
-                    state_str += " (options" + str(state[room]["attributes"][attribute]["options"]) + ")\n"
-                elif "lowest" in state[room]["attributes"][attribute].keys():
-                    state_str += " (range: " + str(state[room]["attributes"][attribute]["lowest"]) + " - " + str(state[room]["attributes"][attribute]["highest"]) + ")\n"
-                else:
-                    state_str += "\n"
-
-        else:
-            for device in state[room].keys():
-                if device == "room_name":
-                    continue
-                else:
-                    state_str += "  " + device + "\n"                    
-                    state_str += "    state: " + state[room][device]["state"] + "\n"
-                    for attribute in state[room][device]["attributes"].keys():
-                        state_str += "    " + attribute + ": " + str(state[room][device]["attributes"][attribute]["value"])
-                        if "options" in state[room][device]["attributes"][attribute].keys():
-                            state_str += " (options" + str(state[room][device]["attributes"][attribute]["options"]) + ")\n"
-                        elif "lowest" in state[room][device]["attributes"][attribute].keys():
-                            state_str += " (range: " + str(state[room][device]["attributes"][attribute]["lowest"]) + " - " + str(state[room][device]["attributes"][attribute]["highest"]) + ")\n"
+            if isinstance(state[room], dict):
+                state_str += "  state: " + str(state[room].get("state", "N/A")) + "\n"
+                if "attributes" in state[room]:
+                    for attribute in state[room]["attributes"].keys():
+                        val = state[room]["attributes"][attribute]
+                        state_str += "  " + attribute + ": " + str(val.get("value", "N/A"))
+                        if "options" in val:
+                            state_str += " (options" + str(val["options"]) + ")\n"
+                        elif "lowest" in val:
+                            state_str += " (range: " + str(val.get("lowest")) + " - " + str(val.get("highest")) + ")\n"
                         else:
                             state_str += "\n"
-        state_str += "<chunk>"
-
-    method_str = ""
-    tmp_room_name = methods[0]["room_name"]
-    for method in methods:
-        if method["room_name"] != tmp_room_name:
-            method_str += "<chunk>"
-            tmp_room_name = method["room_name"]
-        if method["room_name"] == "None":
-            method_str += method["device_name"] + "." + method["operation"] + "("
-        else:
-            method_str += method["room_name"] + "." + method["device_name"] + "." + method["operation"] + "("
-        if len(method["parameters"]) > 0:
-            for parameter in method["parameters"]:
-                method_str += parameter["name"] + ":" + parameter["type"] + ","
-            method_str = method_str[:-1]
-        method_str += "),"
-    return state_str, method_str
-
-def chang_json2str(state,methods):
-    state_str = ""
-    for room in state.keys():
-        state_str += room + ":\n"
-        if room == "VacuumRobot":
-            state_str += "  state: " + state[room]["state"] + "\n"
-            for attribute in state[room]["attributes"].keys():
-                state_str += "  " + attribute + ": " + str(state[room]["attributes"][attribute]["value"])
-                if "options" in state[room]["attributes"][attribute].keys():
-                    state_str += " (options" + str(state[room]["attributes"][attribute]["options"]) + ")\n"
-                elif "lowest" in state[room]["attributes"][attribute].keys():
-                    state_str += " (range: " + str(state[room]["attributes"][attribute]["lowest"]) + " - " + str(state[room]["attributes"][attribute]["highest"]) + ")\n"
-                else:
-                    state_str += "\n"
         else:
             for device in state[room].keys():
-                if device == "room_name":
-                    continue
-                else:
-                    state_str += "  " + device + "\n"
-                    
-                    state_str += "    state: " + state[room][device]["state"] + "\n"
-                    for attribute in state[room][device]["attributes"].keys():
-                        state_str += "    " + attribute + ": " + str(state[room][device]["attributes"][attribute]["value"])
-                        if "options" in state[room][device]["attributes"][attribute].keys():
-                            state_str += " (options" + str(state[room][device]["attributes"][attribute]["options"]) + ")\n"
-                        elif "lowest" in state[room][device]["attributes"][attribute].keys():
-                            state_str += " (range: " + str(state[room][device]["attributes"][attribute]["lowest"]) + " - " + str(state[room][device]["attributes"][attribute]["highest"]) + ")\n"
+                if device == "room_name": continue
+                device_obj = state[room][device]
+                state_str += "  " + device + "\n"
+                state_str += "    state: " + str(device_obj.get("state", "N/A")) + "\n"
+                
+                if "attributes" in device_obj:
+                    for attribute in device_obj["attributes"].keys():
+                        val = device_obj["attributes"][attribute]
+                        state_str += "    " + attribute + ": " + str(val.get("value", "N/A"))
+                        if "options" in val:
+                            state_str += " (options" + str(val["options"]) + ")\n"
+                        elif "lowest" in val:
+                            state_str += " (range: " + str(val.get("lowest")) + " - " + str(val.get("highest")) + ")\n"
                         else:
                             state_str += "\n"
 
     method_str = ""
     for method in methods:
-        if method["room_name"] == "None":
-            method_str += method["device_name"] + "." + method["operation"] + "("
-        else:
-            method_str += method["room_name"] + "." + method["device_name"] + "." + method["operation"] + "("
+        room_prefix = method["room_name"] + "." if method["room_name"] != "None" else ""
+        method_str += f"{room_prefix}{method['device_name']}.{method['operation']}("
+        
         if len(method["parameters"]) > 0:
-            for parameter in method["parameters"]:
-                method_str += parameter["name"] + ":" + parameter["type"] + ","
-            method_str = method_str[:-1]
+            params = [f"{p['name']}:{p['type']}" for p in method["parameters"]]
+            method_str += ",".join(params)
         method_str += ");"
     return state_str, method_str
 
-def compute_accuracy(generated_texts, expected_texts):
-    macro_num_correct = 0
-    micro_num_correct = 0
-    micro_num_total = 0
-    for generated_text, expected_text in zip(generated_texts, expected_texts):
-        generated_text = generated_text.replace("<Machine instructions:>", "")
-        generated_text = generated_text.replace(" ", "")
-        generated_text = generated_text.replace("\n", "")
+# --- Dataset 类 (保持不变) ---
+class no_few_shot_home_assistant_dataset(Dataset):
+    def __init__(self, tokenizer, use_rag=False):
+        self.tokenizer = tokenizer
+        dataset_dir = os.path.join(PROJECT_ROOT, "dataset")
+        code_dir = os.path.join(PROJECT_ROOT, "code")
         
-        ## 匹配{}中的内容
-        # generated_text= generated_text.replace("{","")
-        # generated_text = generated_text.replace("}","")
-        # generated_text = generated_text.replace("<","")
-        # generated_text = generated_text.replace(">","")
-        generated_text = re.findall(r'\{(.*?)\}', generated_text)
-        if len(generated_text) > 1:
-            print("generated_text:",generated_text)
+        if use_rag:
+            with open(os.path.join(dataset_dir, "rag_test_data.json"), "r") as f:
+                self.data = json.loads(f.read())
         else:
-            generated_text = generated_text[0]
+            with open(os.path.join(dataset_dir, "test_data.jsonl"), "r") as f:
+                lines = f.readlines()
+            with open(os.path.join(dataset_dir, "home_status_method.jsonl"), "r") as f_home:
+                lines_home = f_home.readlines()
+            
+            home_status = {}
+            for line in lines_home:
+                data = json.loads(line)
+                home_status[data["home_id"]] = {"home_status": data["home_status"], "method": data["method"]}
+            
+            with open(os.path.join(code_dir, "system.txt"), "r") as f:
+                system = f.read()
+            
+            self.data = []
+            for i in range(len(lines)):
+                try:
+                    case = json.loads(lines[i])
+                    if case["home_id"] not in home_status: continue
+                    state_str, method_str = chang_json2str(home_status[case["home_id"]]["home_status"], home_status[case["home_id"]]["method"])
+                    case_input = "-------------------------------\n" + "Here are the user instructions you need to reply to.\n" + "<User instructions:> \n" + case["input"] + "\n" + "<Machine instructions:>"
+                    home_status_case = "<home_state>\n  The following provides the status of all devices in each room of the current household, the adjustable attributes of each device, and the threshold values for adjustable attributes:"+ state_str + "\n" + "</home_state>\n"
+                    device_method_case = "<device_method>\n     The following provides the methods to control each device in the current household:"+ method_str + "\n" + "</device_method>\n"
+                    full_input = system + home_status_case + device_method_case + case_input
+                    self.data.append({"input": full_input, "output": case["output"]})
+                except Exception as e:
+                    print(f"Error processing line {i}: {e}")
+                    continue
 
+    def __len__(self):
+        return len(self.data)
 
-
-        ## 匹配‘''' '''中的内容
-        expected_text = expected_text.replace("'''", "")
-        expected_text = expected_text.replace(" ","")
-        expected_text = expected_text.replace("\n","")
-        generated_text = generated_text.split(",")
-        expected_text = expected_text.split(",")
-
-        generated_text = [x for x in generated_text if x != ""]
-        expected_text = [x for x in expected_text if x != ""]
-        generated_text = set(generated_text)
-        expected_text = set(expected_text)
-        print("generated_text:",generated_text)
-        print("expected_text:",expected_text)
-
-        if generated_text == expected_text:
-            macro_num_correct += 1
-        if len(expected_text) == 0 and len(generated_text) == 0:
-            micro_num_correct += 1
-            micro_num_total += 1
-        elif len(expected_text) == 0:
-            micro_num_total += 1
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        input_text = [{"role": "system", "content": item["input"]}]
+        output_text = item["output"]
+        if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template:
+            inputs_id = self.tokenizer.apply_chat_template(input_text, add_generation_prompt=True, tokenize=False)
         else:
-            micro_num_correct += len(generated_text & expected_text)
-            micro_num_total += len(expected_text)
-    return macro_num_correct / len(generated_texts), micro_num_correct / micro_num_total
+            inputs_id = item["input"]
+        return inputs_id, output_text
 
-def model_test(model_name,use_rag=False,use_few_shot=False,test_type=None):
-    if model_name == "llama":
-        model_id = '../model_output/llama3-8b-Instruct'
-    elif model_name == "qwen":
-        model_id = '../model_output/Qwen2.5-7B-Instruct'
-    elif model_name == "mistral":
-        model_id = '../model_output/Mistral-7B-Instruct-v0.3'
-    elif model_name == "gemma":
-        model_id = '../model_output/Gemma-7B-Instruct-v0.3'
+# --- 主测试函数 (已修改以支持 DDP) ---
+def model_test(model_name, use_rag=False, use_few_shot=False, test_type=None, batch_size=64):
+    # --- DDP 初始化检查 ---
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    ddp_enabled = local_rank != -1
 
-    print(torch.cuda.is_available())
-    tokenizer = AutoTokenizer.from_pretrained(model_id,padding_side='left')
-    model = AutoModelForCausalLM.from_pretrained(model_id,torch_dtype=torch.bfloat16,device_map="auto")
-    if use_rag:
-        test_dataset = rag_home_assistant_dataset(tokenizer)
-    elif use_few_shot:
-        test_dataset = home_assistant_dataset(tokenizer)
+    if ddp_enabled:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        rank = dist.get_rank()
+        if rank == 0:
+            print(f"DDP Enabled. World Size: {world_size}")
     else:
-        test_dataset = no_few_shot_home_assistant_dataset(tokenizer)
-        print("test_dataset:",len(test_dataset))
-    test_loader = DataLoader(test_dataset, batch_size=1)
-    res = []
-    start_time = time.time()
-    for inputs_id, output_text in tqdm(test_loader):
-        if model_name == "llama" or model_name == "mistral":
-            tokenizer.pad_token = tokenizer.eos_token
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+        rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("Running in Single Process Mode (No DDP).")
 
-        inputs = tokenizer(list(inputs_id), return_tensors="pt",padding=True).to(model.device)
-        if model_name == "llama":
-            terminator = [
-                tokenizer.eos_token_id,
-                tokenizer.convert_tokens_to_ids("<|eot_id|>")
-            ]
-            logits = model.generate(**inputs,max_new_tokens=1024,eos_token_id=terminator,do_sample=True,temperature=1.0,top_p=0.9,pad_token_id=tokenizer.eos_token_id)
+    # 1. 确定路径
+    sub_dirs = {
+        "llama": "llama3-8b-Instruct",
+        "qwen": "Qwen2.5-7B-Instruct",
+        "mistral": "Mistral-7B-Instruct-v0.3",
+        "gemma": "Gemma-7B-Instruct-v0.3"
+    }
+    base_model_dir = os.path.join(PROJECT_ROOT, "models", sub_dirs.get(model_name, ""))
+    adapter_dir = os.path.join(PROJECT_ROOT, "model_output")
+    
+    if not os.path.exists(adapter_dir):
+        if rank == 0: print(f"Error: Output directory not found at {adapter_dir}")
+        return
+
+    # 2. Tokenizer (只打印一次 log)
+    tokenizer_path = adapter_dir if os.path.exists(os.path.join(adapter_dir, "tokenizer.json")) else base_model_dir
+    if rank == 0: print(f"Loading Tokenizer from: {tokenizer_path}")
+    
+    tokenizer = None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, padding_side='left', trust_remote_code=True)
+    except Exception as e:
+        if rank == 0: print(f"Standard tokenizer load failed ({e}), trying manual fallback...")
+        tokenizer_json = os.path.join(tokenizer_path, "tokenizer.json")
+        if os.path.exists(tokenizer_json):
+            if "qwen" in model_name.lower():
+                tokenizer = Qwen2TokenizerFast(tokenizer_file=tokenizer_json)
+            else:
+                tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_json)
+            
+            token_config_path = os.path.join(tokenizer_path, "tokenizer_config.json")
+            if os.path.exists(token_config_path):
+                with open(token_config_path, "r") as f:
+                    data = json.load(f)
+                    if "chat_template" in data: tokenizer.chat_template = data["chat_template"]
+            
+            base_config = AutoConfig.from_pretrained(base_model_dir, trust_remote_code=True)
+            if hasattr(base_config, "pad_token_id") and base_config.pad_token_id is not None:
+                tokenizer.pad_token_id = base_config.pad_token_id
+            if hasattr(base_config, "eos_token_id"):
+                tokenizer.eos_token_id = base_config.eos_token_id
+            tokenizer.padding_side = 'left' 
         else:
-            logits = model.generate(**inputs,max_new_tokens=1024,do_sample=True,temperature=1.0,top_p=0.9)
-        response = logits[:, len(inputs['input_ids'][0]):]
-        generated_texts = tokenizer.batch_decode(response, skip_special_tokens=True)
+            raise e
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        for i in range(len(generated_texts)):
-            res.append({"generated": generated_texts[i], "expected": output_text[i]})
-    end_time = time.time()
-    print("time:",end_time-start_time)
-    f = open("../output/" + model_name + "_" + test_type + "_test_result.json", "w")
-    f.write(json.dumps(res))
-
-def llama_test():
-    model_id = '../model_output/llama3-8b-Instruct'
-    print(torch.cuda.is_available())
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-    model = AutoModelForCausalLM.from_pretrained(model_id,torch_dtype=torch.bfloat16,device_map="auto")
-    test_dataset = home_assistant_dataset()
-    test_loader = DataLoader(test_dataset, batch_size=2)
-    res = []
-    terminator = [
-        tokenizer.eos_token_id,
-        tokenizer.convert_tokens_to_ids("<|eot_id|>")
-    ]
-    print(terminator)
-    print(tokenizer.pad_token,tokenizer.pad_token_id)
-    # Define PAD Token = BOS Token
-    tokenizer.pad_token = tokenizer.bos_token
-    model.config.pad_token_id = model.config.bos_token_id
-
-    for inputs_id, output_text in test_loader:
-        inputs = tokenizer(list(inputs_id), return_tensors="pt",padding=True).to(model.device)
-        logits = model.generate(**inputs,max_new_tokens=1024,eos_token_id=terminator,do_sample=True,temperature=1.0,top_p=0.9)
-        response = logits[:, len(inputs['input_ids'][0]):]
-        generated_texts = tokenizer.batch_decode(response, skip_special_tokens=True)
-        res.append({"generated": generated_texts, "expected": output_text})
-        print("Generated: ", generated_texts)
-
-    f = open("../output/llama_test_result.json", "w")
-    f.write(json.dumps(res))
-
-def qwen_test():
-    model_id = '../model_output/Qwen2.5-7B-Instruct'
-    print(torch.cuda.is_available())
-    tokenizer = AutoTokenizer.from_pretrained(model_id,padding_side='left')
+    # 3. 模型加载 (DDP 模式下加载到特定 GPU)
+    if rank == 0: print(f"Loading Base Model from: {base_model_dir}")
+    
+    # 关键修改：DDP 模式下，不要用 device_map="auto"
+    # 我们希望每个进程在自己的 GPU 上加载完整的模型
+    load_device_map = None if ddp_enabled else "auto"
+    
     model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype="auto",
-        device_map="auto"
+        base_model_dir,
+        torch_dtype=torch.bfloat16,
+        device_map=load_device_map, 
+        trust_remote_code=True
     )
-    test_dataset = home_assistant_dataset(tokenizer)
-    test_loader = DataLoader(test_dataset, batch_size=2)
+
+    if ddp_enabled:
+        model.to(device) # 显式移动到当前进程的 GPU
+
+    is_lora = os.path.exists(os.path.join(adapter_dir, "adapter_config.json"))
+    if is_lora:
+        if rank == 0: print(f"Detected LoRA adapter in {adapter_dir}. Loading adapter...")
+        try:
+            model = PeftModel.from_pretrained(model, adapter_dir)
+            if ddp_enabled:
+                model.to(device) # 确保 adapter 也在正确的设备上
+            if rank == 0: print("Successfully loaded LoRA adapter!")
+        except Exception as e:
+            if rank == 0: print(f"Failed to load LoRA adapter: {e}")
+            return
+
+    # 4. 数据集与 DistributedSampler
+    if rank == 0: print("Loading test dataset...")
+    test_dataset = no_few_shot_home_assistant_dataset(tokenizer, use_rag=use_rag)
+    if rank == 0: print(f"Test dataset size: {len(test_dataset)}")
+    
+    sampler = None
+    if ddp_enabled:
+        # 关键：使用 DistributedSampler 切分数据
+        sampler = DistributedSampler(test_dataset, shuffle=False) # shuffle=False 保持顺序（虽然多卡合并时还是会乱，需要后处理排序或不排序直接合并）
+    
+    # 增大 Batch Size (A800 80G 很大，可以开大一点)
+    # 使用传入的 batch_size，默认为 64
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, sampler=sampler, shuffle=False)
+    
     res = []
-    for inputs_id, output_text in test_loader:
-        inputs = tokenizer(list(inputs_id), return_tensors="pt",padding=True).to(model.device)
-        logits = model.generate(**inputs,max_new_tokens=1024,do_sample=True,temperature=1.0,top_p=0.9)
-        response = logits[:, len(inputs['input_ids'][0]):]
+    
+    # 只有 rank 0 显示进度条，避免刷屏
+    iterator = tqdm(test_loader, disable=(rank != 0))
+    
+    start_time = time.time()
+    
+    for inputs_str, output_text in iterator:
+        # inputs_str 已经在 device 上了吗？不，需要 tokenizing
+        inputs = tokenizer(list(inputs_str), return_tensors="pt", padding=True).to(device)
+        
+        with torch.no_grad():
+            logits = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                do_sample=True,
+                temperature=0.1,
+                top_p=0.9,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id
+            )
+        
+        response = logits[:, inputs['input_ids'].shape[1]:]
         generated_texts = tokenizer.batch_decode(response, skip_special_tokens=True)
+
         for i in range(len(generated_texts)):
             res.append({"generated": generated_texts[i], "expected": output_text[i]})
+            
+    end_time = time.time()
+    if rank == 0: print(f"Total Inference Time: {end_time - start_time:.2f}s")
+    
+    # 5. 保存结果 (每个 Rank 保存自己的部分，然后合并)
+    output_dir = os.path.join(PROJECT_ROOT, "output")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 保存分片文件
+    part_file = os.path.join(output_dir, f"{model_name}_{test_type}_part_{rank}.json")
+    with open(part_file, "w") as f:
+        f.write(json.dumps(res, indent=4, ensure_ascii=False))
+    
+    # 等待所有进程写完
+    if ddp_enabled:
+        dist.barrier()
+    
+    # Rank 0 负责合并
+    if rank == 0:
+        print("Merging results from all ranks...")
+        final_res = []
+        # 查找所有 part 文件
+        pattern = os.path.join(output_dir, f"{model_name}_{test_type}_part_*.json")
+        for file_path in glob.glob(pattern):
+            try:
+                with open(file_path, "r") as f:
+                    part_data = json.load(f)
+                    final_res.extend(part_data)
+                os.remove(file_path) # 合并后删除分片
+            except Exception as e:
+                print(f"Error reading {file_path}: {e}")
+        
+        final_file = os.path.join(output_dir, f"{model_name}_{test_type}_test_result.json")
+        with open(final_file, "w") as f:
+            f.write(json.dumps(final_res, indent=4, ensure_ascii=False))
+        print(f"Final merged results saved to: {final_file} (Total records: {len(final_res)})")
 
-    f = open("../output/qwen_test_result.json", "w")
-    f.write(json.dumps(res))
-
+    if ddp_enabled:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Model Testing Script for HomeBench.")
-    parser.add_argument("--model_name", type=str, default="mistral", 
+    parser.add_argument("--model_name", type=str, default="qwen", 
                         choices=["llama", "qwen", "mistral", "gemma"], 
                         help="Name of the model to test.")
-    parser.add_argument("--use_rag", action="store_true", 
-                        help="Whether to use Retrieval-Augmented Generation (RAG).")
-    parser.add_argument("--use_few_shot", action="store_true", 
-                        help="Whether to use Few-Shot Learning.")
-    parser.add_argument("--test_type", type=str, default="error_input", 
-                        help="Type of test to run (e.g., \"error_input\").")
-    parser.add_argument("--cuda_devices", type=str, default="0,1", 
-                        help="Comma-separated list of CUDA device IDs to use. E.g., \"0,1\" or \"0\".")
+    parser.add_argument("--use_rag", action="store_true", help="Use RAG.")
+    parser.add_argument("--use_few_shot", action="store_true", help="Use Few-Shot.")
+    parser.add_argument("--test_type", type=str, default="normal", help="Type of test.")
+    parser.add_argument("--cuda_devices", type=str, default="0,1", help="CUDA devices.")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size per device for testing.")
 
     args = parser.parse_args()
     
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_devices
-    print(f"Using CUDA devices: {os.environ['CUDA_VISIBLE_DEVICES']}")
-
-    model_test(args.model_name, use_rag=args.use_rag, use_few_shot=args.use_few_shot, test_type=args.test_type)
-    # 以下为示例，如果您需要运行，请取消注释并根据需要调整。
-    # rag_dataset("path/to/your/models/Qwen2.5-7B-Instruct") # 注意这里的路径，我已经修改为相对路径，请根据您的实际情况调整。
-    # llama_test()
-    # qwen_test()
-
-    # 示例评估代码，现在可以通过 eval.py 脚本运行
-    # f = open("../output/llama_test_result.json", "r")
-    # res = json.loads(f.read())
-    # f.close()
-    # generated_texts = []
-    # expected_texts = []
-    # for item in res:
-    #     generated_texts.append(item["generated"])
-    #     expected_texts.append(item["expected"][0])
-    # print(compute_accuracy(generated_texts, expected_texts))
+    # 关键：如果是 torchrun 启动，不要手动覆盖 CUDA_VISIBLE_DEVICES，
+    # 除非你确定你在做什么。DDP 环境下通常由外部控制或默认可见所有。
+    # 这里我们做一个判断：如果没有 LOCAL_RANK 才设置
+    if os.environ.get("LOCAL_RANK") is None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_devices
+        print(f"Using CUDA devices: {args.cuda_devices}")
+    
+    model_test(args.model_name, use_rag=args.use_rag, use_few_shot=args.use_few_shot, test_type=args.test_type, batch_size=args.batch_size)

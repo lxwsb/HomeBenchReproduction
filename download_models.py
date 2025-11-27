@@ -1,4 +1,5 @@
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from huggingface_hub import snapshot_download
 
 # 定义模型列表，包含 Hugging Face 的 repo_id 和在本地 models 文件夹下的子目录名
