@@ -1196,7 +1196,7 @@ class PetFeederDevice:
         for feeding_interval in range(1, 25):
             instructions_list.append({"instruction": f"set_feeding_interval({feeding_interval})", "device": self.name, "explain": "set feeding interval to " + str(feeding_interval) + ' hour'})
         for feeding_weight in range(0, 101, 10):
-            instructions_list.append({"instruction": f"set_feeding_weight({feeding_weight})", "device": self.name}, "explain": "set feeding weight to " + str(feeding_weight) + ' gram')
+            instructions_list.append({"instruction": f"set_feeding_weight({feeding_weight})", "device": self.name, "explain": "set feeding weight to " + str(feeding_weight) + ' gram'})
             if self.attributes["feeding_weight"]["value"] < feeding_weight:
                 instructions_list.append({"instruction": f"set_feeding_weight({feeding_weight})", "device": self.name, "explain": "increase  " + str(feeding_weight-self.attributes["feeding_weight"]["value"]) + '  precent'})
             elif self.attributes["feeding_weight"]["value"] > feeding_weight:

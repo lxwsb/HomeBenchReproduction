@@ -90,7 +90,7 @@ class train_home_assistant_dataset(Dataset):
             file_path = os.path.join(dataset_dir, "test_data.jsonl")
         elif dataset_type == "train":
             # 优先尝试 part1_copy，如果不存在则尝试 part1
-            file_path = os.path.join(dataset_dir, "train_data_part1_copy.jsonl")
+            file_path = os.path.join(dataset_dir, "train_data_part1.jsonl")
             if not os.path.exists(file_path):
                  file_path = os.path.join(dataset_dir, "train_data_part1.jsonl")
         elif dataset_type == "val":
