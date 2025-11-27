@@ -11,7 +11,7 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 # 设置镜像
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-# --- 新增：文本归一化函数 ---
+# --- 文本归一化函数 ---
 def normalize_command(text):
     """
     去除参数名，统一格式。
@@ -21,6 +21,33 @@ def normalize_command(text):
     # 匹配模式: 单词字符 + 等号
     text = re.sub(r'\b[a-zA-Z_]\w*=', '', text)
     return text
+
+# --- 新增：核心解析函数 (正则提取) ---
+def extract_commands(text):
+    """
+    从模型输出中稳健地提取指令。
+    策略：
+    1. 去除空格和换行。
+    2. 使用正则寻找符合 '对象.方法(参数)' 格式的字符串 或 'error_input'。
+    3. 忽略其他所有噪音文本。
+    """
+    if text is None: return []
+    
+    # 1. 基础清洗
+    clean_text = text.replace(" ", "").replace("\n", "")
+    
+    # 2. 正则提取
+    # 模式解释：
+    # (?: ... ) : 非捕获组
+    # [\w\.]+   : 匹配 room.device.method (字母数字下划线和点)
+    # \(.*?\)   : 匹配括号及其中内容 (非贪婪)
+    # |         : 或
+    # error_input : 匹配错误标记
+    pattern = r'(?:[\w\.]+\(.*?\)|error_input)'
+    
+    matches = re.findall(pattern, clean_text)
+    
+    return matches
 
 def compute_accuracy(generated_texts, expected_texts, debug_limit=5):
     print("nums"   , len(generated_texts))
@@ -34,40 +61,17 @@ def compute_accuracy(generated_texts, expected_texts, debug_limit=5):
     debug_count = 0
     
     for generated_text, expected_text in zip(generated_texts, expected_texts):
-        # res = {} # unused
         
         original_generated = generated_text # 备份原始生成文本用于调试
         
-        # 数据清洗
-        if generated_text is None: generated_text = ""
-        generated_text = generated_text.replace(" ", "")
-        generated_text = generated_text.replace("\n", "")
+        # --- 核心修改：使用正则提取代替简单的 split ---
+        generated_list = extract_commands(generated_text)
         
-        # 提取 {} 内容
-        generated_matches = re.findall(r'\{(.*?)\}', generated_text)
+        # 处理 expected (也做同样的清洗，防止格式不一致)
+        # 这里的 expected_text 原始格式通常是逗号分隔的字符串
+        expected_list = extract_commands(expected_text)
 
-        if len(generated_matches) > 0:
-            # 如果找到了花括号，优先使用花括号内的内容
-            generated_text = ",".join(generated_matches)
-        else:
-            # 修复Bug：如果没有找到花括号，保留清洗后的原始内容
-            # 这样 'error_input' 或者忘记加花括号的指令也能被保留
-            pass 
-
-        # 处理 expected
-        if expected_text is None: expected_text = ""
-        expected_text = expected_text.replace("'''", "")
-        expected_text = expected_text.replace(" ","")
-        expected_text = expected_text.replace("\n","")
-        expected_list = expected_text.split(",")
-        expected_list = [x for x in expected_list if x != ""]
-
-        # 处理 generated
-        generated_list = generated_text.split(",")
-        generated_list = [x for x in generated_list if x != ""]
-        
-        # --- 新增：应用归一化 ---
-        # 对生成的指令和预期的指令都进行参数名去除，确保比较公平
+        # --- 应用归一化 ---
         generated_list = [normalize_command(x) for x in generated_list if x != ""]
         expected_list = [normalize_command(x) for x in expected_list if x != ""]
         
@@ -77,13 +81,13 @@ def compute_accuracy(generated_texts, expected_texts, debug_limit=5):
         if generated_counter == expected_counter:
             correct_num += 1
         else:
-            res11.append({"generated":generated_list, "expected":expected_list}) # 存 list 方便看
+            res11.append({"generated": generated_list, "expected": expected_list})
             
             # --- 调试打印 ---
             if debug_count < debug_limit:
                 print(f"\n[Mismatch Case {debug_count + 1}]")
                 print(f"  Raw Generated : {repr(original_generated)}")
-                print(f"  Parsed Generat: {generated_list}")
+                print(f"  Parsed Result : {generated_list}")
                 print(f"  Expected List : {expected_list}")
                 debug_count += 1
         
@@ -145,12 +149,8 @@ def dif_type(test_data):
             item_source = json.loads(data[i])
             item_result = test_data[i]
             
-            # 对齐检查：确保我们在评估同一个 case
-            # 注意：如果 model_test 进行了 shuffle，这里会报错。
-            # model_test_fixed.py 使用了 shuffle=False，所以应该是对齐的。
-            # 为了容错，如果数据不对齐，打印警告
+            # 简单的对齐容错
             if item_source["output"] != item_result["gold_output"]:
-                # 只有当 output 完全不匹配时才可能是错位，但有时格式化会导致微小差异
                 pass 
 
             all_data["expected"].append(item_source["output"])
@@ -201,7 +201,7 @@ def dif_type(test_data):
     
     print("-" * 30)
     print("normal_single")
-    compute_accuracy(normal_single["generated"], normal_single["expected"], debug_limit=0) # 后面不再打印，避免刷屏
+    compute_accuracy(normal_single["generated"], normal_single["expected"], debug_limit=0)
     
     print("-" * 30)
     print("unexist_single")
@@ -209,7 +209,6 @@ def dif_type(test_data):
     
     # 写入错误分析文件
     with open(os.path.join(output_dir, "unexist_single_analysis.json"), "w") as f:
-        # 这里只为了演示，实际上 compute_accuracy 返回的是错误列表
         pass 
 
     print("-" * 30)
@@ -246,7 +245,6 @@ if __name__ == "__main__":
         print(f"Error: Result file not found: {args.result_file}")
         exit(1)
 
-    # 关键修复：使用 json.load 读取整个列表，而不是 readlines
     try:
         with open(args.result_file, "r") as f:
             data = json.load(f)
@@ -256,7 +254,6 @@ if __name__ == "__main__":
         exit(1)
 
     test_data = []
-    # 现在的 data 直接就是 list of dicts
     for item in data:
         # 兼容性处理：如果 item 已经是 dict，不需要再 loads
         if isinstance(item, str):

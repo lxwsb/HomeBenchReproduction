@@ -15,7 +15,13 @@ Reproduction of HomeBench,https://github.com/BITHLP/HomeBench/tree/main
 
 ## 1. 环境准备
 
-确保已安装必要的依赖库，并正确设置了 HF 镜像（代码中已内置 `HF_ENDPOINT` 设置）。
+确保已安装必要的依赖库，并正确设置了 HF 镜像（代码中已内置 `HF_ENDPOINT` 设置），并将模型下载到models文件夹下。
+hf auth login
+export HF_ENDPOINT=https://hf-mirror.com
+echo $HF_ENDPOINT
+
+export HF_TOKEN=Your_HF_TOKEN
+echo $HF_TOKEN
 
 核心文件结构说明：
 
