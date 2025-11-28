@@ -6,14 +6,6 @@ Reproduction of HomeBench,https://github.com/BITHLP/HomeBench/tree/main
 
 请确保您位于项目的**根目录**下执行所有指令 (例如 `/root/autodl-tmp/HomeBenchProduction`)。
 
-## 目录
-
-1. [环境准备](https://www.google.com/search?q=%231-环境准备)
-2. [第一步：监督微调 (SFT)](https://www.google.com/search?q=%232-第一步监督微调-sft)
-3. [第二步：模型推理测试](https://www.google.com/search?q=%233-第二步模型推理测试)
-4. [第三步：结果评估](https://www.google.com/search?q=%234-第三步结果评估)
-5. [附录：RAG 数据集生成](https://www.google.com/search?q=%23附录rag-数据集生成)
-
 ## 1. 环境准备
 
 确保已安装必要的依赖库，并正确设置了 HF 镜像（代码中已内置 `HF_ENDPOINT` 设置）。
@@ -140,6 +132,18 @@ python code/eval_fixed.py --result_file output/qwen_sft_zero_shot_test_result.js
 # 评估 Zero-shot 基线结果
 python code/eval_fixed.py --result_file output/qwen_zero_shot_test_result.json
 ```
+
+## 附录：模型下载
+
+```
+hf auth login
+export HF_ENDPOINT=https://hf-mirror.com
+echo $HF_ENDPOINT
+export HF_TOKEN=YOUR_HF_TOKEN
+echo $HF_TOKEN
+```
+
+**输出：** 模型将在 `models/` 目录下生成文件。
 
 ## 附录：RAG 数据集生成
 
