@@ -246,7 +246,8 @@ def model_test(model_name, use_rag=False, use_few_shot=False, use_finetuned=Fals
     
     base_model_path_name = sub_dirs.get(model_name, model_name)
     base_model_dir = os.path.join(PROJECT_ROOT, "models", base_model_path_name)
-    adapter_dir = os.path.join(PROJECT_ROOT, "model_output")
+    # adapter_dir = os.path.join(PROJECT_ROOT, "model_output")
+    adapter_dir = os.path.join(PROJECT_ROOT, "model_output", f"{model_name}_sft")
     
     if rank == 0: 
         print(f"Test Config: RAG={use_rag}, Few-Shot={use_few_shot}, SFT_Adapter={use_finetuned}")
